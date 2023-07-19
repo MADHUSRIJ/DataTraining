@@ -1,0 +1,19 @@
+forex_api - 
+    Connection Type - http 
+    Host - https://gist.github.com/
+
+forex_path - 
+    Connection Type - File(path)
+    Extra - {
+                "path": "/opt/airflow/dags/files"
+            }
+
+hive_conn - 
+    Connection Type - Hive Server 2 Thrift
+    Host - hive-server
+    Port - 10000
+
+spark_conn - 
+    Connection Type - Spark
+    Host - spark://spark-master
+    Port - 7077
