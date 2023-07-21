@@ -1,59 +1,92 @@
-import os
-import datetime
+from datetime import datetime, timedelta
 import csv
 import requests
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
-from airflow.operators.dummy_operator import DummyOperator
-from airflow.models import Variable
+import xml.etree.ElementTree as ET
+import pandas as pd
+from sqlalchemy import create_engine
+from airflow.operators.python import PythonOperator
+from airflow.operators.email import EmailOperator
+
 
 default_args = {
-    'start_date': datetime.datetime(2023, 7, 19, 23, 0),
+    'start_date': datetime(2023, 7, 18, 23, 0),
     'retries': 3,
-    'retry_delay': datetime.timedelta(minutes=5),
+    'retry_delay': timedelta(minutes=5),
+    'email': ['srimadhu.j@gmail.com'],
+    'email_on_failure': True,
+    'email_on_retry': False,
 }
 
-def download_rss_feed(**kwargs):
+def extract_feed(**kwargs):
     rss_url = 'https://timesofindia.indiatimes.com/rssfeedstopstories.cms'
     response = requests.get(rss_url)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     filename = f'raw_rss_feed_{timestamp}.xml'
     with open(filename, 'w') as file:
         file.write(response.text)
     kwargs['ti'].xcom_push(key='raw_xml_filename', value=filename)
 
-def parse_rss_feed(**kwargs):
+def transform_feed(**kwargs):
     ti = kwargs['ti']
-    filename = ti.xcom_pull(key='raw_xml_filename', task_ids='download_rss_feed')
-    data = extract_information_from_xml(filename)
-    curated_filename = f'curated_{os.path.splitext(filename)[0]}.csv'
+    filename = ti.xcom_pull(key='raw_xml_filename', task_ids='extract')
+
+    tree = ET.parse(filename)
+    root = tree.getroot()
+
+    items = []
+    for item in root.findall('.//item'):
+        title = item.find('title').text
+        link = item.find('link').text
+        pub_date = item.find('pubDate').text
+        items.append((title, link, pub_date))
+
+    curated_filename = f'curated_{datetime.now().strftime("%Y%m%d%H%M%S")}.csv'
     with open(curated_filename, 'w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerows(data)
-    ti.xcom_push(key='curated_csv_filename', value=curated_filename)
+        writer.writerow(['Title', 'Link', 'Pub Date'])
+        writer.writerows(items)
 
-def load_to_database(**kwargs):
+    ti.xcom_push(key='curated_filename', value=curated_filename)
+
+def load_feed(**kwargs):
     ti = kwargs['ti']
-    filename = ti.xcom_pull(key='curated_csv_filename', task_ids='parse_rss_feed')
-    # Perform database loading here
+    filename = ti.xcom_pull(key='curated_filename', task_ids='transform')
 
-def extract_information_from_xml(filename):
-    # Extract the desired information from the XML file and return as a list of rows
-    return []
+    postgres_user = 'airflow'
+    postgres_password = 'airflow'
+    postgres_db = 'airflow_db'
+    postgres_host = 'postgres'  # Use the container service name as the host
 
-with DAG('rss_feed_etl',
+    # Connection string for PostgreSQL
+    conn_str = f"postgresql+psycopg2://{postgres_user}:{postgres_password}@{postgres_host}/{postgres_db}"
+
+    # Establish a database connection
+    engine = create_engine(conn_str)
+
+    df = pd.read_csv(filename)
+
+    df.to_sql('RssNewsFeed', con=engine, if_exists='append', index=False)
+
+with DAG('RssFeed',
          default_args=default_args,
-         schedule_interval='0 23 * * *') as dag:
+         start_date=datetime(2023, 7, 18, 23, 0),
+         schedule_interval='0 23 * * *',) as dag:
 
-    start_task = DummyOperator(task_id='start')
+    download_task = PythonOperator(task_id='extract',
+                                   python_callable=extract_feed)
 
-    download_task = PythonOperator(task_id='download_rss_feed',
-                                   python_callable=download_rss_feed)
+    parse_task = PythonOperator(task_id='transform',
+                                python_callable=transform_feed)
 
-    parse_task = PythonOperator(task_id='parse_rss_feed',
-                                python_callable=parse_rss_feed)
+    load_task = PythonOperator(task_id='load',
+                               python_callable=load_feed)
+    
+    
+    email_task = EmailOperator(task_id='send_email',
+                               to='srimadhu.j@gmail.com',
+                               subject='RssFeed DAG Alert',
+                               html_content='The RssFeed DAG has completed successfully.',
+                               )
 
-    load_task = PythonOperator(task_id='load_to_database',
-                               python_callable=load_to_database)
-
-    start_task >> download_task >> parse_task >> load_task
+    download_task >> parse_task >> load_task >> email_task
